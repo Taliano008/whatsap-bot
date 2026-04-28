@@ -91,4 +91,38 @@ function extractMessage(body) {
   }
 }
 
-module.exports = { sendMessage, markAsRead, extractMessage };
+/**
+ * Send a typing indicator (animated ... bubble) to the customer.
+ */
+async function sendTyping(to) {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+
+  try {
+    await axios.post(
+      `${BASE_URL}/${phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "reaction",
+        // typing_on is the correct action for WhatsApp Cloud API
+        status: "typing_on",
+      },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+  } catch {
+    // Non-critical — don't crash if typing indicator fails
+  }
+}
+
+/**
+ * Delay proportional to reply length — makes responses feel natural, not instant.
+ * Range: 1000ms (short) to 4000ms (long).
+ */
+function typingDelay(text) {
+  const ms = Math.min(1000 + text.length * 10, 4000);
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+module.exports = { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay };

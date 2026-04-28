@@ -1,56 +1,95 @@
-/**
- * Simple in-memory session store.
- * Stores conversation history per WhatsApp phone number.
- * Sessions expire after 30 minutes of inactivity.
- *
- * For production, replace with Redis or a database.
- */
+const { MongoClient } = require("mongodb");
 
-const sessions = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_EXCHANGES = 5; // store last 5 exchanges (10 messages)
 
-function getSession(phoneNumber) {
-  const session = sessions.get(phoneNumber);
-  if (!session) return { history: [] };
+let db = null;
 
-  // Check expiry
-  if (Date.now() - session.lastActive > SESSION_TTL_MS) {
-    sessions.delete(phoneNumber);
-    return { history: [] };
+// In-memory fallback when MongoDB is unavailable
+const memoryStore = new Map();
+
+async function connectMongo() {
+  if (!process.env.MONGODB_URI) return null;
+  try {
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    db = client.db();
+    console.log("✅ MongoDB connected — sessions are persistent");
+    return db;
+  } catch (err) {
+    console.warn("⚠️  MongoDB connection failed — falling back to in-memory sessions:", err.message);
+    return null;
+  }
+}
+
+async function getSession(phoneNumber) {
+  if (db) {
+    try {
+      const doc = await db.collection("sessions").findOne({ phoneNumber });
+      if (!doc) return { history: [] };
+      if (Date.now() - doc.lastActive > SESSION_TTL_MS) {
+        await db.collection("sessions").deleteOne({ phoneNumber });
+        return { history: [] };
+      }
+      return { history: doc.history || [] };
+    } catch {
+      // fall through to memory
+    }
   }
 
+  const session = memoryStore.get(phoneNumber);
+  if (!session) return { history: [] };
+  if (Date.now() - session.lastActive > SESSION_TTL_MS) {
+    memoryStore.delete(phoneNumber);
+    return { history: [] };
+  }
   return session;
 }
 
-function updateSession(phoneNumber, userMessage, assistantReply) {
-  const session = getSession(phoneNumber);
+async function updateSession(phoneNumber, userMessage, assistantReply) {
+  const session = await getSession(phoneNumber);
 
   session.history.push(
     { role: "user", content: userMessage },
     { role: "assistant", content: assistantReply }
   );
 
-  // Keep only last 10 turns (20 messages) to avoid token bloat
-  if (session.history.length > 20) {
-    session.history = session.history.slice(-20);
+  // Keep only last MAX_EXCHANGES exchanges
+  if (session.history.length > MAX_EXCHANGES * 2) {
+    session.history = session.history.slice(-(MAX_EXCHANGES * 2));
   }
 
-  session.lastActive = Date.now();
-  sessions.set(phoneNumber, session);
+  const now = Date.now();
+
+  if (db) {
+    try {
+      await db.collection("sessions").updateOne(
+        { phoneNumber },
+        { $set: { history: session.history, lastActive: now } },
+        { upsert: true }
+      );
+      return;
+    } catch {
+      // fall through to memory
+    }
+  }
+
+  memoryStore.set(phoneNumber, { history: session.history, lastActive: now });
 }
 
 function clearSession(phoneNumber) {
-  sessions.delete(phoneNumber);
+  if (db) {
+    db.collection("sessions").deleteOne({ phoneNumber }).catch(() => {});
+  }
+  memoryStore.delete(phoneNumber);
 }
 
-// Cleanup expired sessions every 10 minutes
+// Cleanup expired in-memory sessions every 10 minutes
 setInterval(() => {
   const now = Date.now();
-  for (const [phone, session] of sessions.entries()) {
-    if (now - session.lastActive > SESSION_TTL_MS) {
-      sessions.delete(phone);
-    }
+  for (const [phone, session] of memoryStore.entries()) {
+    if (now - session.lastActive > SESSION_TTL_MS) memoryStore.delete(phone);
   }
 }, 10 * 60 * 1000);
 
-module.exports = { getSession, updateSession, clearSession };
+module.exports = { connectMongo, getSession, updateSession, clearSession };

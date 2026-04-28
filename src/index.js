@@ -1,18 +1,43 @@
 require("dotenv").config();
 const express = require("express");
-const { sendMessage, markAsRead, extractMessage } = require("./whatsapp");
+const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
-const { getSession, updateSession } = require("./sessions");
+const { connectMongo, getSession, updateSession } = require("./sessions");
+const { getInventory } = require("./sheets");
 
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`${req.method} ${req.path} ${res.statusCode} — ${Date.now() - start}ms`);
+  });
+  next();
+});
 
 // ── Health check ─────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
+app.get("/", async (req, res) => {
+  let sheetsStatus = "ok";
+  let productCount = null;
+
+  try {
+    const inventory = await getInventory();
+    productCount = inventory.length;
+  } catch (err) {
+    sheetsStatus = `error: ${err.message}`;
+  }
+
+  const healthy = sheetsStatus === "ok";
+
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "degraded",
     service: `${process.env.SHOP_NAME || "Electronics Shop"} WhatsApp Bot`,
     timestamp: new Date().toISOString(),
+    checks: {
+      server: "ok",
+      googleSheets: sheetsStatus,
+      ...(productCount !== null && { productCount }),
+    },
   });
 });
 
@@ -54,14 +79,20 @@ app.post("/webhook", async (req, res) => {
   setTimeout(() => app.locals.processedMessages.delete(dedupKey), 5 * 60 * 1000);
 
   try {
+    // Show typing indicator immediately after read receipt
+    await sendTyping(from);
+
     // Load conversation history for this number
-    const session = getSession(from);
+    const session = await getSession(from);
 
     // Generate reply using Claude + live inventory
     const reply = await generateReply(text, session.history);
 
+    // Wait a natural delay proportional to reply length
+    await typingDelay(reply);
+
     // Save to session memory
-    updateSession(from, text, reply);
+    await updateSession(from, text, reply);
 
     // Send reply back via WhatsApp
     await sendMessage(from, reply);
@@ -87,9 +118,13 @@ app.post("/webhook", async (req, res) => {
 
 // ── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 ${process.env.SHOP_NAME || "Electronics Shop"} WhatsApp Bot running`);
-  console.log(`   Port: ${PORT}`);
-  console.log(`   Webhook URL: https://YOUR_RAILWAY_URL/webhook`);
-  console.log(`   Verify token: ${process.env.WEBHOOK_VERIFY_TOKEN || "(not set)"}\n`);
+
+connectMongo().then((mongoDb) => {
+  const memoryMode = mongoDb ? "MongoDB persistent (last 5 exchanges)" : "In-memory (no MONGODB_URI set)";
+  app.listen(PORT, () => {
+    console.log(`\n🚀 ${process.env.SHOP_NAME || "Electronics Shop"} WhatsApp Bot`);
+    console.log(`   Port    : ${PORT}`);
+    console.log(`   Memory  : ${memoryMode}`);
+    console.log(`   Typing  : ✅ enabled\n`);
+  });
 });

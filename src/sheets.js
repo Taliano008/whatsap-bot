@@ -6,11 +6,22 @@ let sheetsClient = null;
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
 
+  let authConfig;
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    // Render/Railway: full JSON stored as env var
+    authConfig = { credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON) };
+  } else {
+    // Local: path to JSON key file
+    authConfig = {
+      keyFile: path.resolve(
+        process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH ||
+          "./config/google-service-account.json"
+      ),
+    };
+  }
+
   const auth = new google.auth.GoogleAuth({
-    keyFile: path.resolve(
-      process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH ||
-        "./config/google-service-account.json"
-    ),
+    ...authConfig,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
