@@ -41,6 +41,17 @@ app.get("/", async (req, res) => {
   });
 });
 
+// ── Privacy policy ───────────────────────────────────────────────────────────
+app.get("/privacy", (req, res) => {
+  res.send(`
+    <h1>TechHub Electronics — Privacy Policy</h1>
+    <p>We collect your WhatsApp name and phone number solely to respond
+    to your enquiries. We do not share your data with third parties.
+    Conversations are stored for service continuity only.</p>
+    <p>Contact: ${process.env.SHOP_EMAIL || "info@techhub.co.ke"}</p>
+  `);
+});
+
 // ── Webhook verification (Meta one-time handshake) ───────────────────────────
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
