@@ -155,15 +155,34 @@ function detectIntent(message) {
  * Extract a search term from the customer message for inventory lookup.
  */
 function extractSearchTerm(message) {
-  // Strip common filler words to get the core product term
-  return message
+  const cleaned = message
+    .replace(/give me (a )?(list of |some )?/gi, "")
+    .replace(/show me (a )?(list of |some )?/gi, "")
+    .replace(/share (the )?(list of )?/gi, "")
+    .replace(/what .{0,20}do you (have|sell|stock)\??/gi, "")
     .replace(/do you (have|sell|stock)/gi, "")
     .replace(/how much (is|are|does)/gi, "")
     .replace(/i (want|need|am looking for|am interested in)/gi, "")
     .replace(/what is the price of/gi, "")
     .replace(/is .+ available/gi, "")
+    .replace(/and (their |the )?(prices?|cost)/gi, "")
+    .replace(/with (their |the )?(prices?|cost)/gi, "")
+    .replace(/\b(all|the|a|an|some|any|your|you|me|us)\b/gi, "")
     .replace(/[?!.,]/g, "")
+    .replace(/\s{2,}/g, " ")
     .trim();
+
+  // If cleaned term still has no product keyword, fall back to first noun-like word
+  const productKeywords = [
+    "tv", "television", "phone", "laptop", "computer", "tablet", "ipad",
+    "samsung", "apple", "iphone", "hp", "dell", "lenovo", "sony", "lg",
+    "speaker", "earphone", "headphone", "airpod", "watch", "smartwatch",
+    "camera", "printer", "router", "ssd", "storage", "keyboard", "mouse",
+    "monitor", "playstation", "xbox", "console",
+  ];
+  const lowerCleaned = cleaned.toLowerCase();
+  const matched = productKeywords.find((kw) => lowerCleaned.includes(kw));
+  return matched || cleaned;
 }
 
 /**
