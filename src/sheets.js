@@ -27,9 +27,10 @@ async function getInventory() {
   const sheets = await getSheetsClient();
   const sheetId = process.env.GOOGLE_SHEET_ID;
 
+  const tabName = process.env.GOOGLE_SHEET_TAB_NAME || "Inventory";
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: "Inventory!A2:L1000", // Skip header row
+    range: `${tabName}!A2:L1000`, // Skip header row
   });
 
   const rows = response.data.values || [];

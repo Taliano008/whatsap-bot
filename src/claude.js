@@ -189,7 +189,7 @@ async function generateReply(userMessage, conversationHistory = []) {
       }
     } catch (err) {
       console.error("Sheets query failed:", err.message);
-      inventoryContext = "\n[Note: Could not fetch live inventory right now — answer based on general knowledge of the shop]";
+      inventoryContext = "\n[SYSTEM: Live inventory is temporarily unavailable. Do NOT quote any prices, product names, or stock levels. Tell the customer you are checking and will get back to them shortly.]";
     }
   }
 
