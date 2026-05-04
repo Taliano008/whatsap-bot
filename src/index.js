@@ -2,8 +2,9 @@ require("dotenv").config();
 const express = require("express");
 const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
-const { connectMongo, getSession, updateSession } = require("./sessions");
+const { connectMongo, getSession, updateSession, setHandoff, getHandoffSessions } = require("./sessions");
 const { getInventory } = require("./sheets");
+const { isHandoffRequest, activateHandoff } = require("./handoff");
 
 const app = express();
 app.use(express.json());
@@ -90,22 +91,59 @@ app.post("/webhook", async (req, res) => {
   setTimeout(() => app.locals.processedMessages.delete(dedupKey), 5 * 60 * 1000);
 
   try {
-    // Show typing indicator immediately after read receipt
-    await sendTyping(from);
+    const ownerPhone = process.env.OWNER_PHONE;
+    const isOwner = ownerPhone && from === ownerPhone;
 
-    // Load conversation history for this number
+    // ── Owner #bot command — resume handoff sessions ──────────────────────────
+    if (isOwner && text.trim().toLowerCase().startsWith("#bot")) {
+      const parts = text.trim().split(/\s+/);
+      let customerPhones;
+      if (parts[1]) {
+        customerPhones = [parts[1].replace(/^\+/, "")];
+      } else {
+        customerPhones = await getHandoffSessions();
+      }
+
+      if (customerPhones.length === 0) {
+        await sendMessage(from, "No customers currently in handoff mode.");
+        return;
+      }
+
+      for (const customerPhone of customerPhones) {
+        await setHandoff(customerPhone, false);
+        await sendMessage(customerPhone, "You're back with our assistant! How can I help you? 😊");
+        console.log(`🤖 [Bot resumed for ${customerPhone}]`);
+      }
+      await sendMessage(from, `✅ Bot resumed for ${customerPhones.length} customer(s).`);
+      return;
+    }
+
+    // ── Load session ──────────────────────────────────────────────────────────
     const session = await getSession(from);
 
-    // Generate reply using Claude + live inventory
+    // ── Handoff mode active — bot stays silent for this customer ─────────────
+    if (session.handoff) {
+      console.log(`⏸️  [Handoff active — ignoring message from ${from}]`);
+      return;
+    }
+
+    // ── Detect human handoff request ─────────────────────────────────────────
+    if (isHandoffRequest(text)) {
+      await setHandoff(from, true);
+      await activateHandoff(from, contact, text);
+      console.log(`🔔 [Handoff activated for ${contact} | ${from}]`);
+      return;
+    }
+
+    // ── Normal AI flow ────────────────────────────────────────────────────────
+    await sendTyping(from);
+
     const reply = await generateReply(text, session.history);
 
-    // Wait a natural delay proportional to reply length
     await typingDelay(reply);
 
-    // Save to session memory
     await updateSession(from, text, reply);
 
-    // Send reply back via WhatsApp
     await sendMessage(from, reply);
 
     console.log(`📤 [Bot → ${from}]: ${reply.substring(0, 80)}...`);

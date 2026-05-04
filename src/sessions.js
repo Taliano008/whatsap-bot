@@ -26,24 +26,58 @@ async function getSession(phoneNumber) {
   if (db) {
     try {
       const doc = await db.collection("sessions").findOne({ phoneNumber });
-      if (!doc) return { history: [] };
+      if (!doc) return { history: [], handoff: false };
       if (Date.now() - doc.lastActive > SESSION_TTL_MS) {
         await db.collection("sessions").deleteOne({ phoneNumber });
-        return { history: [] };
+        return { history: [], handoff: false };
       }
-      return { history: doc.history || [] };
+      return { history: doc.history || [], handoff: doc.handoff || false };
     } catch {
       // fall through to memory
     }
   }
 
   const session = memoryStore.get(phoneNumber);
-  if (!session) return { history: [] };
+  if (!session) return { history: [], handoff: false };
   if (Date.now() - session.lastActive > SESSION_TTL_MS) {
     memoryStore.delete(phoneNumber);
-    return { history: [] };
+    return { history: [], handoff: false };
   }
   return session;
+}
+
+async function setHandoff(phoneNumber, active) {
+  const now = Date.now();
+  if (db) {
+    try {
+      await db.collection("sessions").updateOne(
+        { phoneNumber },
+        { $set: { handoff: active, lastActive: now } },
+        { upsert: true }
+      );
+      return;
+    } catch {
+      // fall through to memory
+    }
+  }
+  const session = memoryStore.get(phoneNumber) || { history: [] };
+  memoryStore.set(phoneNumber, { ...session, handoff: active, lastActive: now });
+}
+
+async function getHandoffSessions() {
+  if (db) {
+    try {
+      const docs = await db.collection("sessions").find({ handoff: true }).toArray();
+      return docs.map((d) => d.phoneNumber);
+    } catch {
+      // fall through to memory
+    }
+  }
+  const result = [];
+  for (const [phone, session] of memoryStore.entries()) {
+    if (session.handoff) result.push(phone);
+  }
+  return result;
 }
 
 async function updateSession(phoneNumber, userMessage, assistantReply) {
@@ -92,4 +126,4 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-module.exports = { connectMongo, getSession, updateSession, clearSession };
+module.exports = { connectMongo, getSession, updateSession, clearSession, setHandoff, getHandoffSessions };
