@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
-const { connectMongo, getSession, updateSession, setHandoff, getHandoffSessions, setPendingOrder } = require("./sessions");
+const { connectMongo, connectRedis, getSession, updateSession, setHandoff, getHandoffSessions, setPendingOrder } = require("./sessions");
 const { getInventory } = require("./sheets");
 const { isHandoffRequest, activateHandoff } = require("./handoff");
 const { createOrder, getOrdersByPhone, updateOrderStatus, getPendingOrders } = require("./orders");
@@ -327,14 +327,16 @@ app.post("/webhook", async (req, res) => {
 // ── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-connectMongo().then((mongoDb) => {
-  const memoryMode = mongoDb ? "MongoDB persistent (last 5 exchanges)" : "In-memory (no MONGODB_URI set)";
+Promise.all([connectRedis(), connectMongo()]).then(([redisClient, mongoDb]) => {
+  const sessionStore = redisClient ? "Redis" : "In-memory";
+  const orderStore   = mongoDb    ? "MongoDB" : "In-memory";
   app.listen(PORT, () => {
     console.log(`\n🚀 ${process.env.SHOP_NAME || "Electronics Shop"} WhatsApp Bot`);
-    console.log(`   Port    : ${PORT}`);
-    console.log(`   Memory  : ${memoryMode}`);
-    console.log(`   Typing  : ✅ enabled`);
-    console.log(`   Handoff : ✅ enabled`);
-    console.log(`   Orders  : ✅ enabled\n`);
+    console.log(`   Port     : ${PORT}`);
+    console.log(`   Sessions : ${sessionStore}`);
+    console.log(`   Orders   : ${orderStore}`);
+    console.log(`   Typing   : ✅ enabled`);
+    console.log(`   Handoff  : ✅ enabled`);
+    console.log(`   Orders   : ✅ enabled\n`);
   });
 });

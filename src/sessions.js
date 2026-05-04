@@ -1,41 +1,59 @@
 const { MongoClient } = require("mongodb");
+const Redis = require("ioredis");
 
-const SESSION_TTL_MS = 30 * 60 * 1000;
-const MAX_EXCHANGES = 5; // store last 5 exchanges (10 messages)
+const SESSION_TTL = 30 * 60; // 30 minutes in seconds
+const MAX_EXCHANGES = 5;
 
 let db = null;
+let redis = null;
 
-// In-memory fallback when MongoDB is unavailable
+// In-memory fallback when neither Redis nor MongoDB is available
 const memoryStore = new Map();
 
+// ── MongoDB (used by orders module) ───────────────────────────────────────────
 async function connectMongo() {
   if (!process.env.MONGODB_URI) return null;
   try {
     const client = new MongoClient(process.env.MONGODB_URI);
     await client.connect();
     db = client.db();
-    console.log("✅ MongoDB connected — sessions are persistent");
+    console.log("✅ MongoDB connected — orders are persistent");
     return db;
   } catch (err) {
-    console.warn("⚠️  MongoDB connection failed — falling back to in-memory sessions:", err.message);
+    console.warn("⚠️  MongoDB connection failed:", err.message);
     return null;
   }
 }
 
+// ── Redis (used for sessions) ─────────────────────────────────────────────────
+async function connectRedis() {
+  if (!process.env.REDIS_URL) return null;
+  try {
+    redis = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      enableOfflineQueue: false,
+    });
+    await redis.ping();
+    console.log("✅ Redis connected — sessions are persistent");
+    return redis;
+  } catch (err) {
+    console.warn("⚠️  Redis connection failed — using in-memory sessions:", err.message);
+    redis = null;
+    return null;
+  }
+}
+
+function getDb() {
+  return db;
+}
+
+// ── Session helpers ───────────────────────────────────────────────────────────
 async function getSession(phoneNumber) {
-  if (db) {
+  if (redis) {
     try {
-      const doc = await db.collection("sessions").findOne({ phoneNumber });
-      if (!doc) return { history: [], handoff: false, pendingOrder: null };
-      if (Date.now() - doc.lastActive > SESSION_TTL_MS) {
-        await db.collection("sessions").deleteOne({ phoneNumber });
-        return { history: [], handoff: false, pendingOrder: null };
-      }
-      return {
-        history: doc.history || [],
-        handoff: doc.handoff || false,
-        pendingOrder: doc.pendingOrder || null,
-      };
+      const raw = await redis.get(`session:${phoneNumber}`);
+      if (!raw) return { history: [], handoff: false, pendingOrder: null };
+      return JSON.parse(raw);
     } catch {
       // fall through to memory
     }
@@ -43,45 +61,24 @@ async function getSession(phoneNumber) {
 
   const session = memoryStore.get(phoneNumber);
   if (!session) return { history: [], handoff: false, pendingOrder: null };
-  if (Date.now() - session.lastActive > SESSION_TTL_MS) {
+  if (Date.now() - session.lastActive > SESSION_TTL * 1000) {
     memoryStore.delete(phoneNumber);
     return { history: [], handoff: false, pendingOrder: null };
   }
   return session;
 }
 
-async function setHandoff(phoneNumber, active) {
-  const now = Date.now();
-  if (db) {
+async function _saveSession(phoneNumber, session) {
+  session.lastActive = Date.now();
+  if (redis) {
     try {
-      await db.collection("sessions").updateOne(
-        { phoneNumber },
-        { $set: { handoff: active, lastActive: now } },
-        { upsert: true }
-      );
+      await redis.setex(`session:${phoneNumber}`, SESSION_TTL, JSON.stringify(session));
       return;
     } catch {
       // fall through to memory
     }
   }
-  const session = memoryStore.get(phoneNumber) || { history: [] };
-  memoryStore.set(phoneNumber, { ...session, handoff: active, lastActive: now });
-}
-
-async function getHandoffSessions() {
-  if (db) {
-    try {
-      const docs = await db.collection("sessions").find({ handoff: true }).toArray();
-      return docs.map((d) => d.phoneNumber);
-    } catch {
-      // fall through to memory
-    }
-  }
-  const result = [];
-  for (const [phone, session] of memoryStore.entries()) {
-    if (session.handoff) result.push(phone);
-  }
-  return result;
+  memoryStore.set(phoneNumber, session);
 }
 
 async function updateSession(phoneNumber, userMessage, assistantReply) {
@@ -92,65 +89,77 @@ async function updateSession(phoneNumber, userMessage, assistantReply) {
     { role: "assistant", content: assistantReply }
   );
 
-  // Keep only last MAX_EXCHANGES exchanges
   if (session.history.length > MAX_EXCHANGES * 2) {
     session.history = session.history.slice(-(MAX_EXCHANGES * 2));
   }
 
-  const now = Date.now();
-
-  if (db) {
-    try {
-      await db.collection("sessions").updateOne(
-        { phoneNumber },
-        { $set: { history: session.history, lastActive: now } },
-        { upsert: true }
-      );
-      return;
-    } catch {
-      // fall through to memory
-    }
-  }
-
-  const existing = memoryStore.get(phoneNumber) || {};
-  memoryStore.set(phoneNumber, { ...existing, history: session.history, lastActive: now });
+  await _saveSession(phoneNumber, session);
 }
 
-function clearSession(phoneNumber) {
-  if (db) {
-    db.collection("sessions").deleteOne({ phoneNumber }).catch(() => {});
+async function clearSession(phoneNumber) {
+  if (redis) {
+    try {
+      await redis.del(`session:${phoneNumber}`);
+      await redis.srem("handoff:active", phoneNumber);
+    } catch {}
   }
   memoryStore.delete(phoneNumber);
 }
 
-function getDb() {
-  return db;
-}
+// ── Handoff ───────────────────────────────────────────────────────────────────
+async function setHandoff(phoneNumber, active) {
+  const session = await getSession(phoneNumber);
+  session.handoff = active;
+  await _saveSession(phoneNumber, session);
 
-async function setPendingOrder(phoneNumber, pendingOrder) {
-  const now = Date.now();
-  if (db) {
+  if (redis) {
     try {
-      await db.collection("sessions").updateOne(
-        { phoneNumber },
-        { $set: { pendingOrder, lastActive: now } },
-        { upsert: true }
-      );
-      return;
-    } catch {
-      // fall through to memory
-    }
+      if (active) {
+        await redis.sadd("handoff:active", phoneNumber);
+      } else {
+        await redis.srem("handoff:active", phoneNumber);
+      }
+    } catch {}
   }
-  const session = memoryStore.get(phoneNumber) || { history: [] };
-  memoryStore.set(phoneNumber, { ...session, pendingOrder, lastActive: now });
 }
 
-// Cleanup expired in-memory sessions every 10 minutes
+async function getHandoffSessions() {
+  if (redis) {
+    try {
+      return await redis.smembers("handoff:active");
+    } catch {}
+  }
+  const result = [];
+  for (const [phone, session] of memoryStore.entries()) {
+    if (session.handoff) result.push(phone);
+  }
+  return result;
+}
+
+// ── Pending order ─────────────────────────────────────────────────────────────
+async function setPendingOrder(phoneNumber, pendingOrder) {
+  const session = await getSession(phoneNumber);
+  session.pendingOrder = pendingOrder;
+  await _saveSession(phoneNumber, session);
+}
+
+// ── Cleanup expired in-memory sessions every 10 minutes (Redis uses TTL) ─────
 setInterval(() => {
+  if (redis) return;
   const now = Date.now();
   for (const [phone, session] of memoryStore.entries()) {
-    if (now - session.lastActive > SESSION_TTL_MS) memoryStore.delete(phone);
+    if (now - session.lastActive > SESSION_TTL * 1000) memoryStore.delete(phone);
   }
 }, 10 * 60 * 1000);
 
-module.exports = { connectMongo, getSession, updateSession, clearSession, setHandoff, getHandoffSessions, getDb, setPendingOrder };
+module.exports = {
+  connectMongo,
+  connectRedis,
+  getSession,
+  updateSession,
+  clearSession,
+  setHandoff,
+  getHandoffSessions,
+  setPendingOrder,
+  getDb,
+};
