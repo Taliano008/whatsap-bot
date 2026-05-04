@@ -26,22 +26,26 @@ async function getSession(phoneNumber) {
   if (db) {
     try {
       const doc = await db.collection("sessions").findOne({ phoneNumber });
-      if (!doc) return { history: [], handoff: false };
+      if (!doc) return { history: [], handoff: false, pendingOrder: null };
       if (Date.now() - doc.lastActive > SESSION_TTL_MS) {
         await db.collection("sessions").deleteOne({ phoneNumber });
-        return { history: [], handoff: false };
+        return { history: [], handoff: false, pendingOrder: null };
       }
-      return { history: doc.history || [], handoff: doc.handoff || false };
+      return {
+        history: doc.history || [],
+        handoff: doc.handoff || false,
+        pendingOrder: doc.pendingOrder || null,
+      };
     } catch {
       // fall through to memory
     }
   }
 
   const session = memoryStore.get(phoneNumber);
-  if (!session) return { history: [], handoff: false };
+  if (!session) return { history: [], handoff: false, pendingOrder: null };
   if (Date.now() - session.lastActive > SESSION_TTL_MS) {
     memoryStore.delete(phoneNumber);
-    return { history: [], handoff: false };
+    return { history: [], handoff: false, pendingOrder: null };
   }
   return session;
 }
@@ -108,7 +112,8 @@ async function updateSession(phoneNumber, userMessage, assistantReply) {
     }
   }
 
-  memoryStore.set(phoneNumber, { history: session.history, lastActive: now });
+  const existing = memoryStore.get(phoneNumber) || {};
+  memoryStore.set(phoneNumber, { ...existing, history: session.history, lastActive: now });
 }
 
 function clearSession(phoneNumber) {
@@ -116,6 +121,28 @@ function clearSession(phoneNumber) {
     db.collection("sessions").deleteOne({ phoneNumber }).catch(() => {});
   }
   memoryStore.delete(phoneNumber);
+}
+
+function getDb() {
+  return db;
+}
+
+async function setPendingOrder(phoneNumber, pendingOrder) {
+  const now = Date.now();
+  if (db) {
+    try {
+      await db.collection("sessions").updateOne(
+        { phoneNumber },
+        { $set: { pendingOrder, lastActive: now } },
+        { upsert: true }
+      );
+      return;
+    } catch {
+      // fall through to memory
+    }
+  }
+  const session = memoryStore.get(phoneNumber) || { history: [] };
+  memoryStore.set(phoneNumber, { ...session, pendingOrder, lastActive: now });
 }
 
 // Cleanup expired in-memory sessions every 10 minutes
@@ -126,4 +153,4 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-module.exports = { connectMongo, getSession, updateSession, clearSession, setHandoff, getHandoffSessions };
+module.exports = { connectMongo, getSession, updateSession, clearSession, setHandoff, getHandoffSessions, getDb, setPendingOrder };

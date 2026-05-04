@@ -2,10 +2,103 @@ require("dotenv").config();
 const express = require("express");
 const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
-const { connectMongo, getSession, updateSession, setHandoff, getHandoffSessions } = require("./sessions");
+const { connectMongo, getSession, updateSession, setHandoff, getHandoffSessions, setPendingOrder } = require("./sessions");
 const { getInventory } = require("./sheets");
 const { isHandoffRequest, activateHandoff } = require("./handoff");
+const { createOrder, getOrdersByPhone, updateOrderStatus, getPendingOrders } = require("./orders");
 
+// ── Order tracking constants ──────────────────────────────────────────────────
+const STATUS_LABELS = {
+  pending:    "Pending confirmation ⏳",
+  confirmed:  "Confirmed ✅",
+  processing: "Being prepared 🔧",
+  shipped:    "Shipped 🚚",
+  delivered:  "Delivered 📦",
+  cancelled:  "Cancelled ❌",
+};
+
+const VALID_STATUSES = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled"];
+
+function isTrackingRequest(text) {
+  return /track.{0,10}order|order.{0,10}status|check.{0,10}order|my orders?|ambia.{0,5}order|order yangu/i.test(text);
+}
+
+function isOrderIntent(text) {
+  return /place.{0,5}order|place an order|nataka order|niagize|nataka kuagiza|order now|i want to order/i.test(text);
+}
+
+function buildStatusMessage(order, status) {
+  const msgs = {
+    confirmed:  `Your order ${order.orderId} has been confirmed! ✅\n${order.items}\nWe're getting it ready for delivery to ${order.location} 🙌`,
+    processing: `Your order ${order.orderId} is being prepared! 🔧\n${order.items}\nAlmost ready for delivery to ${order.location}`,
+    shipped:    `Your order ${order.orderId} is on its way! 🚚\n${order.items}\nHeading to ${order.location} — expect it soon!`,
+    delivered:  `Your order ${order.orderId} has been delivered! 📦\nThank you for shopping with us 🙏\nEnjoy your purchase!`,
+    cancelled:  `Your order ${order.orderId} has been cancelled.\nSorry about that! Feel free to reach out if you have any questions 🙏`,
+  };
+  return msgs[status] || `Your order ${order.orderId} has been updated. Status: ${status}`;
+}
+
+async function handleOrderStep(from, contact, text, session) {
+  const { step, items, location } = session.pendingOrder;
+  const lower = text.trim().toLowerCase();
+
+  if (step === "product") {
+    await setPendingOrder(from, { step: "location", items: text.trim(), location: "" });
+    await sendMessage(from, `Got it! 📝\n\nWhat's your delivery location?\n(e.g. Westlands, Nairobi)`);
+    return;
+  }
+
+  if (step === "location") {
+    await setPendingOrder(from, { step: "confirm", items, location: text.trim() });
+    await sendMessage(
+      from,
+      `Here's your order summary:\n\n` +
+      `🛒 Item: ${items}\n` +
+      `📍 Delivery: ${text.trim()}\n\n` +
+      `Our team will confirm the total and send payment details.\n\n` +
+      `Confirm this order? (Yes / No)`
+    );
+    return;
+  }
+
+  if (step === "confirm") {
+    if (/^(yes|ndio|confirm|sawa|ok|yep|yeah|sure)\b/i.test(lower)) {
+      const order = await createOrder({ phone: from, name: contact, items, location });
+      await setPendingOrder(from, null);
+
+      const ownerPhone = process.env.OWNER_PHONE;
+      if (ownerPhone) {
+        await sendMessage(
+          ownerPhone,
+          `🛒 *New Order*\n\n` +
+          `ID: ${order.orderId}\n` +
+          `Customer: ${contact} (+${from})\n` +
+          `Items: ${order.items}\n` +
+          `Location: ${order.location}\n\n` +
+          `Reply: #order ${order.orderId} confirmed`
+        );
+      }
+
+      await sendMessage(
+        from,
+        `Order placed! 🎉\n\n` +
+        `Order ID: ${order.orderId}\n\n` +
+        `Our team will contact you shortly with payment details and delivery timeline.\n\n` +
+        `To check your order anytime, just say "track my order" 📦`
+      );
+      console.log(`🛒 [New order ${order.orderId} — ${contact} | ${from}]`);
+
+    } else if (/^(no|hapana|cancel|nope|nah)\b/i.test(lower)) {
+      await setPendingOrder(from, null);
+      await sendMessage(from, "No worries, order cancelled!\nLet me know if you'd like to start over or need anything else 😊");
+
+    } else {
+      await sendMessage(from, "Just reply Yes to confirm or No to cancel your order 😊");
+    }
+  }
+}
+
+// ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
@@ -74,12 +167,11 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   const message = extractMessage(req.body);
-  if (!message) return; // Status update or unsupported type — ignore
+  if (!message) return;
 
   const { from, messageId, text, contact } = message;
   console.log(`📩 [${contact} | ${from}]: ${text}`);
 
-  // Mark as read (shows blue ticks)
   await markAsRead(messageId);
 
   // Prevent duplicate processing (Meta sometimes sends twice)
@@ -87,14 +179,13 @@ app.post("/webhook", async (req, res) => {
   if (app.locals.processedMessages?.has(dedupKey)) return;
   if (!app.locals.processedMessages) app.locals.processedMessages = new Set();
   app.locals.processedMessages.add(dedupKey);
-  // Clean up dedup set after 5 minutes
   setTimeout(() => app.locals.processedMessages.delete(dedupKey), 5 * 60 * 1000);
 
   try {
     const ownerPhone = process.env.OWNER_PHONE;
     const isOwner = ownerPhone && from === ownerPhone;
 
-    // ── Owner #bot command — resume handoff sessions ──────────────────────────
+    // ── Owner: resume bot (#bot) ──────────────────────────────────────────────
     if (isOwner && text.trim().toLowerCase().startsWith("#bot")) {
       const parts = text.trim().split(/\s+/);
       let customerPhones;
@@ -118,16 +209,85 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // ── Owner: list active orders (#orders) ───────────────────────────────────
+    if (isOwner && text.trim().toLowerCase() === "#orders") {
+      const orders = await getPendingOrders();
+      if (orders.length === 0) {
+        await sendMessage(from, "No active orders at the moment.");
+        return;
+      }
+      const list = orders
+        .map((o) =>
+          `${o.orderId}\n👤 ${o.name} (+${o.phone})\n🛒 ${o.items}\n📍 ${o.location}\nStatus: ${STATUS_LABELS[o.status] || o.status}`
+        )
+        .join("\n─────────────\n");
+      await sendMessage(from, `📋 Active Orders (${orders.length}):\n\n${list}`);
+      return;
+    }
+
+    // ── Owner: update order status (#order <id> <status>) ─────────────────────
+    if (isOwner && /^#order\s+\S+\s+\S+/i.test(text.trim())) {
+      const parts = text.trim().split(/\s+/);
+      const orderId = parts[1].toUpperCase();
+      const newStatus = parts[2].toLowerCase();
+
+      if (!VALID_STATUSES.includes(newStatus)) {
+        await sendMessage(from, `Invalid status. Use one of:\n${VALID_STATUSES.join(", ")}`);
+        return;
+      }
+
+      const order = await updateOrderStatus(orderId, newStatus);
+      if (!order) {
+        await sendMessage(from, `Order ${orderId} not found.`);
+        return;
+      }
+
+      await sendMessage(from, `✅ ${orderId} → ${newStatus}`);
+
+      if (process.env.ORDER_NOTIFY !== "false") {
+        await sendMessage(order.phone, buildStatusMessage(order, newStatus));
+        console.log(`📬 [Status notification → ${order.phone}]: ${newStatus}`);
+      }
+      return;
+    }
+
     // ── Load session ──────────────────────────────────────────────────────────
     const session = await getSession(from);
 
-    // ── Handoff mode active — bot stays silent for this customer ─────────────
+    // ── Handoff mode active — bot stays silent ────────────────────────────────
     if (session.handoff) {
       console.log(`⏸️  [Handoff active — ignoring message from ${from}]`);
       return;
     }
 
-    // ── Detect human handoff request ─────────────────────────────────────────
+    // ── Order tracking request ────────────────────────────────────────────────
+    if (isTrackingRequest(text)) {
+      const orders = await getOrdersByPhone(from);
+      if (orders.length === 0) {
+        await sendMessage(from, "I don't see any orders linked to your number yet.\nReady to place one? Just let me know what you'd like! 😊");
+        return;
+      }
+      const lines = orders
+        .map((o) => `${o.orderId} — ${o.items}\nStatus: ${STATUS_LABELS[o.status] || o.status}`)
+        .join("\n\n");
+      await sendMessage(from, `Here are your recent orders:\n\n${lines}\n\nQuestions about your order? Just ask 😊`);
+      return;
+    }
+
+    // ── Pending order step in progress ────────────────────────────────────────
+    if (session.pendingOrder) {
+      await handleOrderStep(from, contact, text, session);
+      return;
+    }
+
+    // ── Order intent — start order flow ──────────────────────────────────────
+    if (isOrderIntent(text)) {
+      await setPendingOrder(from, { step: "product", items: "", location: "" });
+      await sendMessage(from, "Sure, let's get your order sorted! 🛒\n\nWhat would you like to order?\n(e.g. Samsung Galaxy A55, 1 unit)");
+      return;
+    }
+
+    // ── Human handoff request ─────────────────────────────────────────────────
     if (isHandoffRequest(text)) {
       await setHandoff(from, true);
       await activateHandoff(from, contact, text);
@@ -147,10 +307,10 @@ app.post("/webhook", async (req, res) => {
     await sendMessage(from, reply);
 
     console.log(`📤 [Bot → ${from}]: ${reply.substring(0, 80)}...`);
+
   } catch (err) {
     console.error("❌ Error processing message:", err.message);
 
-    // Send a graceful fallback message so customer isn't left hanging
     try {
       await sendMessage(
         from,
@@ -159,7 +319,6 @@ app.post("/webhook", async (req, res) => {
           " 🙏"
       );
     } catch {
-      // If even fallback fails, log and move on
       console.error("Failed to send fallback message");
     }
   }
@@ -174,6 +333,8 @@ connectMongo().then((mongoDb) => {
     console.log(`\n🚀 ${process.env.SHOP_NAME || "Electronics Shop"} WhatsApp Bot`);
     console.log(`   Port    : ${PORT}`);
     console.log(`   Memory  : ${memoryMode}`);
-    console.log(`   Typing  : ✅ enabled\n`);
+    console.log(`   Typing  : ✅ enabled`);
+    console.log(`   Handoff : ✅ enabled`);
+    console.log(`   Orders  : ✅ enabled\n`);
   });
 });
