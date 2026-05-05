@@ -129,28 +129,34 @@ async function getCategorySummary() {
 async function appendOrderRow(order) {
   const sheets = await getSheetsClient();
   const sheetId = process.env.GOOGLE_SHEET_ID;
-  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "Orders";
+  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "OrdersTable";
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: `${tabName}!A:J`,
-    valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: [[
-        order.orderId,
-        order.timestamp,
-        order.customerName,
-        order.phone,
-        order.product,
-        order.quantity,
-        order.unitPrice,
-        order.total,
-        order.status || "Pending",
-        order.notes || "",
-      ]],
-    },
-  });
+  try {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range: `${tabName}!A:J`,
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [[
+          order.orderId,
+          order.timestamp,
+          order.customerName,
+          order.phone,
+          order.product,
+          order.quantity,
+          order.unitPrice,
+          order.total,
+          order.status || "Pending",
+          order.notes || "",
+        ]],
+      },
+    });
+    console.log(`📋 [Order logged to sheet "${tabName}"]: ${order.orderId}`);
+  } catch (err) {
+    console.error(`❌ [Sheet write failed — tab "${tabName}" | sheet "${sheetId}"]`, err.message);
+    throw err;
+  }
 }
 
 module.exports = {
