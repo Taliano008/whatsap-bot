@@ -1,5 +1,6 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const { searchInventory, formatInventoryForPrompt, getCategorySummary } = require("./sheets");
+const { detectLanguage, getLanguageInstruction } = require("./language");
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -140,6 +141,8 @@ function detectIntent(message) {
     "price", "cost", "how much", "bei", "stock", "available", "in stock",
     "do you have", "mnauza", "una", "sell", "selling", "buy", "purchase",
     "what do you sell", "products", "items", "brands",
+    "simu", "kompyuta", "runinga", "betri", "chaji", "bidhaa",
+    "bei gani", "ngapi", "iko", "ipo", "nataka", "nunua",
   ];
 
   const hasProductIntent = productKeywords.some((kw) => m.includes(kw));
@@ -190,6 +193,10 @@ function extractSearchTerm(message) {
  * query inventory if needed and return Claude's reply.
  */
 async function generateReply(userMessage, conversationHistory = []) {
+  const language = detectLanguage(userMessage);
+  const languageInstruction = getLanguageInstruction(language);
+  if (language === "sw") console.log("Swahili detected - switching language");
+
   const intent = detectIntent(userMessage);
   let inventoryContext = "";
 
@@ -216,7 +223,9 @@ async function generateReply(userMessage, conversationHistory = []) {
 
 ${inventoryContext ? `LIVE INVENTORY DATA (from our Google Sheet — use this to answer accurately):\n${inventoryContext}` : ""}
 
-IMPORTANT: Base product availability, prices and stock levels ONLY on the live inventory data above. Never make up prices or claim a product is in stock if it is not shown. If no inventory data is provided, answer from the shop FAQs and policies above.`;
+IMPORTANT: Base product availability, prices and stock levels ONLY on the live inventory data above. Never make up prices or claim a product is in stock if it is not shown. If no inventory data is provided, answer from the shop FAQs and policies above.
+
+${languageInstruction}`;
 
   // Build messages array with conversation history
   const messages = [
