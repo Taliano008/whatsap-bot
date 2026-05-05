@@ -15,4 +15,14 @@ function detectLanguage(text) {
   return hasSwahili ? "sw" : "en";
 }
 
-module.exports = { detectLanguage };
+/**
+ * Return a language instruction string for the Claude system prompt.
+ */
+function getLanguageInstruction(language) {
+  if (language === "sw") {
+    return "LANGUAGE: The customer is writing in Swahili. Reply in Swahili. Keep it natural and conversational — avoid overly formal Swahili.";
+  }
+  return "LANGUAGE: Reply in English. Keep it natural and friendly.";
+}
+
+module.exports = { detectLanguage, getLanguageInstruction };
