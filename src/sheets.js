@@ -159,10 +159,65 @@ async function appendOrderRow(order) {
   }
 }
 
+function normalizeOrderRow(row, rowNumber) {
+  return {
+    orderId: row[0] || "",
+    timestamp: row[1] || "",
+    name: row[2] || "",
+    phone: String(row[3] || "").replace(/\D/g, ""),
+    product: row[4] || "",
+    quantity: row[5] || "",
+    unitPrice: row[6] || "",
+    total: row[7] || "",
+    status: row[8] || "Pending",
+    notes: row[9] || "",
+    rowNumber,
+  };
+}
+
+async function getOrderRows() {
+  const sheets = await getSheetsClient();
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "Orders";
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${tabName}!A2:J1000`,
+  });
+
+  return (response.data.values || [])
+    .map((row, index) => normalizeOrderRow(row, index + 2))
+    .filter((order) => order.orderId);
+}
+
+async function updateOrderStatusRow(orderId, status) {
+  const sheets = await getSheetsClient();
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "Orders";
+  const targetId = String(orderId || "").trim().toUpperCase();
+  const orders = await getOrderRows();
+  const order = orders.find((o) => o.orderId.toUpperCase() === targetId);
+
+  if (!order) return null;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `${tabName}!I${order.rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [[status]],
+    },
+  });
+
+  return { ...order, status };
+}
+
 module.exports = {
   getInventory,
   searchInventory,
   formatInventoryForPrompt,
   getCategorySummary,
   appendOrderRow,
+  getOrderRows,
+  updateOrderStatusRow,
 };

@@ -1,6 +1,6 @@
 const memoryOrders = new Map();
 const pendingOrders = new Map();
-const { appendOrderRow } = require("./sheets");
+const { appendOrderRow, getOrderRows, updateOrderStatusRow } = require("./sheets");
 const { detectLanguage } = require("./language");
 
 const ORDER_TRIGGERS = [
@@ -80,6 +80,37 @@ function clearPendingOrder(phone) {
 
 function formatMoney(amount) {
   return Number(amount || 0).toLocaleString("en-KE");
+}
+
+function normalizePhone(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
+
+function normalizeStatus(status) {
+  return String(status || "").trim().toLowerCase();
+}
+
+function sheetOrderToOrder(row) {
+  return {
+    orderId: row.orderId,
+    phone: row.phone,
+    name: row.name,
+    items: row.product,
+    status: normalizeStatus(row.status || "pending"),
+    location: row.notes || "",
+    createdAt: row.timestamp ? new Date(row.timestamp) : new Date(0),
+    updatedAt: row.timestamp ? new Date(row.timestamp) : new Date(0),
+    total: row.total,
+  };
+}
+
+async function getSheetOrders() {
+  try {
+    return (await getOrderRows()).map(sheetOrderToOrder);
+  } catch (err) {
+    console.warn("Sheet order lookup failed:", err.message);
+    return [];
+  }
 }
 
 async function logOrderToSheet(phone, customerName, pending) {
@@ -194,12 +225,30 @@ async function createOrder({ phone, name, items, location }) {
 }
 
 async function getOrdersByPhone(phone) {
+  const normalizedPhone = normalizePhone(phone);
   const db = getDb();
+  const ordersById = new Map();
+
   if (db) {
-    return db.collection("orders").find({ phone }).sort({ createdAt: -1 }).limit(5).toArray();
+    const dbOrders = await db
+      .collection("orders")
+      .find({ phone: normalizedPhone })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray();
+    dbOrders.forEach((order) => ordersById.set(order.orderId, order));
+  } else {
+    [...memoryOrders.values()]
+      .filter((o) => normalizePhone(o.phone) === normalizedPhone)
+      .forEach((order) => ordersById.set(order.orderId, order));
   }
-  return [...memoryOrders.values()]
-    .filter((o) => o.phone === phone)
+
+  const sheetOrders = await getSheetOrders();
+  sheetOrders
+    .filter((o) => normalizePhone(o.phone) === normalizedPhone)
+    .forEach((order) => ordersById.set(order.orderId, order));
+
+  return [...ordersById.values()]
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, 5);
 }
@@ -209,36 +258,60 @@ async function updateOrderStatus(orderId, newStatus) {
   const now = new Date();
   const db = getDb();
   if (db) {
-    await db.collection("orders").updateOne(
+    const result = await db.collection("orders").updateOne(
       { orderId: id },
       {
         $set: { status: newStatus, updatedAt: now },
         $push: { history: { status: newStatus, at: now } },
       }
     );
-    return db.collection("orders").findOne({ orderId: id });
+    if (result.matchedCount > 0) {
+      return db.collection("orders").findOne({ orderId: id });
+    }
+  } else {
+    const order = memoryOrders.get(id);
+    if (order) {
+      order.status = newStatus;
+      order.updatedAt = now;
+      order.history.push({ status: newStatus, at: now });
+      return order;
+    }
   }
-  const order = memoryOrders.get(id);
-  if (!order) return null;
-  order.status = newStatus;
-  order.updatedAt = now;
-  order.history.push({ status: newStatus, at: now });
-  return order;
+
+  try {
+    const sheetOrder = await updateOrderStatusRow(id, newStatus);
+    return sheetOrder ? sheetOrderToOrder(sheetOrder) : null;
+  } catch (err) {
+    console.warn("Sheet order status update failed:", err.message);
+    throw err;
+  }
 }
 
 async function getPendingOrders() {
   const active = ["pending", "confirmed", "processing"];
   const db = getDb();
+  const ordersById = new Map();
+
   if (db) {
-    return db
+    const dbOrders = await db
       .collection("orders")
       .find({ status: { $in: active } })
       .sort({ createdAt: -1 })
       .limit(10)
       .toArray();
+    dbOrders.forEach((order) => ordersById.set(order.orderId, order));
+  } else {
+    [...memoryOrders.values()]
+      .filter((o) => active.includes(normalizeStatus(o.status)))
+      .forEach((order) => ordersById.set(order.orderId, order));
   }
-  return [...memoryOrders.values()]
-    .filter((o) => active.includes(o.status))
+
+  const sheetOrders = await getSheetOrders();
+  sheetOrders
+    .filter((o) => active.includes(normalizeStatus(o.status)))
+    .forEach((order) => ordersById.set(order.orderId, order));
+
+  return [...ordersById.values()]
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, 10);
 }
