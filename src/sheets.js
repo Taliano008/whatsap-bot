@@ -12,7 +12,7 @@ async function getSheetsClient() {
 
   const auth = new google.auth.GoogleAuth({
     ...authConfig,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
   sheetsClient = google.sheets({ version: "v4", auth });
@@ -126,4 +126,37 @@ async function getCategorySummary() {
     .join("\n");
 }
 
-module.exports = { getInventory, searchInventory, formatInventoryForPrompt, getCategorySummary };
+async function appendOrderRow(order) {
+  const sheets = await getSheetsClient();
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "Orders";
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range: `${tabName}!A:J`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: {
+      values: [[
+        order.orderId,
+        order.timestamp,
+        order.customerName,
+        order.phone,
+        order.product,
+        order.quantity,
+        order.unitPrice,
+        order.total,
+        order.status || "Pending",
+        order.notes || "",
+      ]],
+    },
+  });
+}
+
+module.exports = {
+  getInventory,
+  searchInventory,
+  formatInventoryForPrompt,
+  getCategorySummary,
+  appendOrderRow,
+};

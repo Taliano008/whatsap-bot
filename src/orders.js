@@ -1,4 +1,30 @@
 const memoryOrders = new Map();
+const pendingOrders = new Map();
+const { appendOrderRow } = require("./sheets");
+const { detectLanguage } = require("./language");
+
+const ORDER_TRIGGERS = [
+  "i want to order",
+  "i want to buy",
+  "i'd like to order",
+  "id like to order",
+  "place an order",
+  "can i order",
+  "i'll take",
+  "ill take",
+  "purchase",
+  "buy now",
+  "order now",
+  "i want",
+  "i need",
+  "nataka kununua",
+  "nataka kuorder",
+  "naomba",
+  "nipe",
+  "niletee",
+  "nitake",
+  "order ya",
+];
 
 function getDb() {
   return require("./sessions").getDb();
@@ -7,8 +33,140 @@ function getDb() {
 function generateOrderId() {
   const d = new Date();
   const date = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
-  const rand = Math.random().toString(36).slice(2, 5).toUpperCase();
+  const rand = String(Math.floor(1000 + Math.random() * 9000));
   return `ORD-${date}-${rand}`;
+}
+
+function normalizeText(text) {
+  return String(text || "").trim().toLowerCase();
+}
+
+function isOrderRequest(text) {
+  const normalized = normalizeText(text);
+  return ORDER_TRIGGERS.some((trigger) => normalized.includes(trigger));
+}
+
+function isConfirmation(text) {
+  return /^(yes|y|yeah|yep|confirm|confirmed|ok|okay|sawa|ndio|ndiyo)\b/i.test(normalizeText(text));
+}
+
+function isCancellation(text) {
+  return /^(no|n|nope|nah|cancel|stop|not today|hapana)\b/i.test(normalizeText(text));
+}
+
+function hasPendingOrder(phone) {
+  return pendingOrders.has(phone);
+}
+
+function setPendingOrder(phone, order) {
+  if (!order) {
+    pendingOrders.delete(phone);
+    return;
+  }
+
+  pendingOrders.set(phone, {
+    ...order,
+    language: order.language || detectLanguage(`${order.product || ""}`),
+  });
+}
+
+function getPendingOrder(phone) {
+  return pendingOrders.get(phone);
+}
+
+function clearPendingOrder(phone) {
+  pendingOrders.delete(phone);
+}
+
+function formatMoney(amount) {
+  return Number(amount || 0).toLocaleString("en-KE");
+}
+
+async function logOrderToSheet(phone, customerName, pending) {
+  const orderId = generateOrderId();
+  const timestamp = new Date().toLocaleString("en-KE", { timeZone: "Africa/Nairobi" });
+
+  await appendOrderRow({
+    orderId,
+    timestamp,
+    customerName,
+    phone: `+${phone}`,
+    product: pending.product,
+    quantity: pending.quantity,
+    unitPrice: pending.price,
+    total: pending.total,
+    status: "Pending",
+    notes: "",
+  });
+
+  return orderId;
+}
+
+function buildConfirmationMessage(order) {
+  const sw = order.language === "sw";
+
+  if (sw) {
+    return [
+      "Hii ndiyo muhtasari wa order yako:",
+      "",
+      `Bidhaa: ${order.product}`,
+      `Idadi: ${order.quantity}`,
+      `Bei: KSh ${formatMoney(order.price)} kila moja`,
+      `Jumla: KSh ${formatMoney(order.total)}`,
+      "",
+      "Kuthibitisha, jibu NDIYO.",
+      "Kufuta, jibu HAPANA.",
+    ].join("\n");
+  }
+
+  return [
+    "Here's your order summary:",
+    "",
+    `Product: ${order.product}`,
+    `Quantity: ${order.quantity}`,
+    `Price: KSh ${formatMoney(order.price)} each`,
+    `Total: KSh ${formatMoney(order.total)}`,
+    "",
+    "To confirm, reply YES.",
+    "To cancel, reply NO.",
+    "",
+    `Payment via M-Pesa Paybill ${process.env.MPESA_PAYBILL || "123456"} after confirmation.`,
+  ].join("\n");
+}
+
+function buildSuccessMessage(orderId, order) {
+  const sw = order.language === "sw";
+  const paybill = process.env.MPESA_PAYBILL || "123456";
+
+  if (sw) {
+    return [
+      "Order imethibitishwa!",
+      "",
+      `Order ID: ${orderId}`,
+      `Bidhaa: ${order.product}`,
+      `Jumla: KSh ${formatMoney(order.total)}`,
+      "",
+      "Hatua inayofuata: Lipa kupitia M-Pesa",
+      `Paybill: ${paybill}`,
+      `Account: ${orderId}`,
+      "",
+      "Tutathibitisha delivery tukipokea malipo. Asante!",
+    ].join("\n");
+  }
+
+  return [
+    "Order confirmed!",
+    "",
+    `Order ID: ${orderId}`,
+    `Product: ${order.product}`,
+    `Total: KSh ${formatMoney(order.total)}`,
+    "",
+    "Next step: Pay via M-Pesa",
+    `Paybill: ${paybill}`,
+    `Account: ${orderId}`,
+    "",
+    "We'll confirm delivery details once payment is received. Thank you!",
+  ].join("\n");
 }
 
 async function createOrder({ phone, name, items, location }) {
@@ -85,4 +243,20 @@ async function getPendingOrders() {
     .slice(0, 10);
 }
 
-module.exports = { createOrder, getOrdersByPhone, updateOrderStatus, getPendingOrders };
+module.exports = {
+  ORDER_TRIGGERS,
+  isOrderRequest,
+  isConfirmation,
+  isCancellation,
+  hasPendingOrder,
+  setPendingOrder,
+  getPendingOrder,
+  clearPendingOrder,
+  logOrderToSheet,
+  buildConfirmationMessage,
+  buildSuccessMessage,
+  createOrder,
+  getOrdersByPhone,
+  updateOrderStatus,
+  getPendingOrders,
+};

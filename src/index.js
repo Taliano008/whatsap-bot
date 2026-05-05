@@ -2,10 +2,25 @@ require("dotenv").config();
 const express = require("express");
 const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
-const { connectMongo, connectRedis, getSession, updateSession, setHandoff, getHandoffSessions, setPendingOrder } = require("./sessions");
+const { connectMongo, connectRedis, getSession, updateSession, setHandoff, getHandoffSessions } = require("./sessions");
 const { getInventory } = require("./sheets");
 const { isHandoffRequest, activateHandoff } = require("./handoff");
-const { createOrder, getOrdersByPhone, updateOrderStatus, getPendingOrders } = require("./orders");
+const {
+  isOrderRequest,
+  isConfirmation,
+  isCancellation,
+  hasPendingOrder,
+  setPendingOrder,
+  getPendingOrder,
+  clearPendingOrder,
+  logOrderToSheet,
+  buildConfirmationMessage,
+  buildSuccessMessage,
+  getOrdersByPhone,
+  updateOrderStatus,
+  getPendingOrders,
+} = require("./orders");
+const { detectLanguage } = require("./language");
 
 // ── Order tracking constants ──────────────────────────────────────────────────
 const STATUS_LABELS = {
@@ -21,10 +36,6 @@ const VALID_STATUSES = ["pending", "confirmed", "processing", "shipped", "delive
 
 function isTrackingRequest(text) {
   return /track.{0,10}order|order.{0,10}status|check.{0,10}order|my orders?|ambia.{0,5}order|order yangu/i.test(text);
-}
-
-function isOrderIntent(text) {
-  return /place.{0,5}order|place an order|nataka order|niagize|nataka kuagiza|order now|i want to order/i.test(text);
 }
 
 function buildStatusMessage(order, status) {
@@ -261,6 +272,88 @@ app.post("/webhook", async (req, res) => {
     }
 
     // ── Order tracking request ────────────────────────────────────────────────
+    // Customer has a pending order awaiting confirmation
+    if (hasPendingOrder(from)) {
+      const pending = getPendingOrder(from);
+
+      if (isConfirmation(text)) {
+        try {
+          const orderId = await logOrderToSheet(from, contact, pending);
+          clearPendingOrder(from);
+
+          const successMsg = buildSuccessMessage(orderId, pending);
+          await typingDelay(successMsg);
+          await sendMessage(from, successMsg);
+          await updateSession(from, text, successMsg);
+
+          const ownerPhone = (process.env.OWNER_PHONE || "").replace(/\D/g, "");
+          if (ownerPhone) {
+            await sendMessage(
+              ownerPhone,
+              `New Order!\n\nOrder: ${orderId}\nCustomer: ${contact} (+${from})\nProduct: ${pending.product}\nTotal: KSh ${pending.total}\n\nCheck your Google Sheet.`
+            );
+          }
+        } catch (err) {
+          console.error("Order logging failed:", err.message);
+          await sendMessage(from, "Sorry, there was an issue placing your order. Please try again or call us directly.");
+        }
+        return;
+      }
+
+      if (isCancellation(text)) {
+        clearPendingOrder(from);
+        const cancelMsg = pending.language === "sw"
+          ? "Sawa, order yako imefutwa.\nUnaweza kurudi ukiwa tayari.\nKuna kitu kingine nikusaidie?"
+          : "No problem! Your order has been cancelled.\nFeel free to come back when you're ready.\nIs there anything else I can help you with?";
+        await sendMessage(from, cancelMsg);
+        await updateSession(from, text, cancelMsg);
+        return;
+      }
+
+      const reminder = pending.language === "sw"
+        ? "Jibu NDIYO kuthibitisha au HAPANA kufuta order yako."
+        : "Please reply YES to confirm or NO to cancel your order.";
+      await sendMessage(from, reminder);
+      return;
+    }
+
+    // Customer is requesting to place an order
+    if (isOrderRequest(text)) {
+      await sendTyping(from);
+
+      const language = detectLanguage(text);
+      const orderPrompt = `${text}\n\n[SYSTEM: The customer wants to place an order. Check inventory for the product they mentioned. If found, respond ONLY with this exact format so the system can parse it:\nORDER_PRODUCT: {full product name}\nORDER_PRICE: {price as number only}\nORDER_QTY: 1\nThen on a new line write the confirmation message to the customer.]`;
+
+      const reply = await generateReply(orderPrompt, session.history);
+      const productMatch = reply.match(/ORDER_PRODUCT:\s*(.+)/i);
+      const priceMatch = reply.match(/ORDER_PRICE:\s*([\d,]+)/i);
+      const qtyMatch = reply.match(/ORDER_QTY:\s*(\d+)/i);
+
+      if (productMatch && priceMatch) {
+        const product = productMatch[1].trim();
+        const price = parseInt(priceMatch[1].replace(/\D/g, ""), 10);
+        const quantity = qtyMatch ? parseInt(qtyMatch[1], 10) : 1;
+        const total = price * quantity;
+        const pendingOrder = { product, price, quantity, total, language };
+
+        setPendingOrder(from, pendingOrder);
+
+        const confirmMsg = buildConfirmationMessage(pendingOrder);
+        await typingDelay(confirmMsg);
+        await sendMessage(from, confirmMsg);
+        await updateSession(from, text, confirmMsg);
+      } else {
+        const cleanReply = reply
+          .replace(/ORDER_PRODUCT:.*/gi, "")
+          .replace(/ORDER_PRICE:.*/gi, "")
+          .replace(/ORDER_QTY:.*/gi, "")
+          .trim();
+        await updateSession(from, text, cleanReply);
+        await sendMessage(from, cleanReply);
+      }
+      return;
+    }
+
     if (isTrackingRequest(text)) {
       const orders = await getOrdersByPhone(from);
       if (orders.length === 0) {
@@ -275,18 +368,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     // ── Pending order step in progress ────────────────────────────────────────
-    if (session.pendingOrder) {
-      await handleOrderStep(from, contact, text, session);
-      return;
-    }
-
     // ── Order intent — start order flow ──────────────────────────────────────
-    if (isOrderIntent(text)) {
-      await setPendingOrder(from, { step: "product", items: "", location: "" });
-      await sendMessage(from, "Sure, let's get your order sorted! 🛒\n\nWhat would you like to order?\n(e.g. Samsung Galaxy A55, 1 unit)");
-      return;
-    }
-
     // ── Human handoff request ─────────────────────────────────────────────────
     if (isHandoffRequest(text)) {
       await setHandoff(from, true);
