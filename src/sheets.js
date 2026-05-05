@@ -212,6 +212,21 @@ async function updateOrderStatusRow(orderId, status) {
   return { ...order, status };
 }
 
+async function getOrdersFromSheet({ status, dateFilter } = {}) {
+  let orders = await getOrderRows();
+
+  if (status) {
+    orders = orders.filter((o) => o.status.toLowerCase() === status.toLowerCase());
+  }
+
+  if (dateFilter === "today") {
+    const today = new Date().toLocaleDateString("en-KE", { timeZone: "Africa/Nairobi" });
+    orders = orders.filter((o) => o.timestamp.includes(today));
+  }
+
+  return orders;
+}
+
 module.exports = {
   getInventory,
   searchInventory,
@@ -220,4 +235,5 @@ module.exports = {
   appendOrderRow,
   getOrderRows,
   updateOrderStatusRow,
+  getOrdersFromSheet,
 };

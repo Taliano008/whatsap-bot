@@ -3,7 +3,7 @@ const express = require("express");
 const { sendMessage, markAsRead, extractMessage, sendTyping, typingDelay } = require("./whatsapp");
 const { generateReply } = require("./claude");
 const { connectMongo, connectRedis, getSession, updateSession, setHandoff, getHandoffSessions } = require("./sessions");
-const { getInventory } = require("./sheets");
+const { getInventory, getOrdersFromSheet, updateOrderStatusRow } = require("./sheets");
 const { isHandoffRequest, activateHandoff } = require("./handoff");
 const {
   isOrderRequest,
@@ -17,8 +17,6 @@ const {
   buildConfirmationMessage,
   buildSuccessMessage,
   getOrdersByPhone,
-  updateOrderStatus,
-  getPendingOrders,
 } = require("./orders");
 const { detectLanguage } = require("./language");
 
@@ -34,19 +32,37 @@ const STATUS_LABELS = {
 
 const VALID_STATUSES = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled"];
 
+function chunkMessage(text, limit = 3800) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    if ((current + line + "\n").length > limit) {
+      if (current) chunks.push(current.trim());
+      current = line + "\n";
+    } else {
+      current += line + "\n";
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
 function isTrackingRequest(text) {
   return /track.{0,10}order|order.{0,10}status|check.{0,10}order|my orders?|ambia.{0,5}order|order yangu/i.test(text);
 }
 
 function buildStatusMessage(order, status) {
+  const id = order.orderId;
+  const item = order.product || order.items || "";
   const msgs = {
-    confirmed:  `Your order ${order.orderId} has been confirmed! ✅\n${order.items}\nWe're getting it ready for delivery to ${order.location} 🙌`,
-    processing: `Your order ${order.orderId} is being prepared! 🔧\n${order.items}\nAlmost ready for delivery to ${order.location}`,
-    shipped:    `Your order ${order.orderId} is on its way! 🚚\n${order.items}\nHeading to ${order.location} — expect it soon!`,
-    delivered:  `Your order ${order.orderId} has been delivered! 📦\nThank you for shopping with us 🙏\nEnjoy your purchase!`,
-    cancelled:  `Your order ${order.orderId} has been cancelled.\nSorry about that! Feel free to reach out if you have any questions 🙏`,
+    confirmed:  `Your order ${id} is confirmed! ✅\n${item}\nWe're getting it ready 🙌`,
+    processing: `Your order ${id} is being prepared! 🔧\n${item}\nAlmost ready!`,
+    shipped:    `Your order ${id} is on its way! 🚚\n${item}\nExpect it soon!`,
+    delivered:  `Your order ${id} has been delivered! 📦\nThank you for shopping with us 🙏`,
+    cancelled:  `Your order ${id} has been cancelled.\nSorry about that! Feel free to reach out if you have questions 🙏`,
   };
-  return msgs[status] || `Your order ${order.orderId} has been updated. Status: ${status}`;
+  return msgs[status] || `Your order ${id} has been updated. Status: ${status}`;
 }
 
 async function handleOrderStep(from, contact, text, session) {
@@ -220,23 +236,38 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // ── Owner: list active orders (#orders) ───────────────────────────────────
-    if (isOwner && text.trim().toLowerCase() === "#orders") {
-      const orders = await getPendingOrders();
-      if (orders.length === 0) {
-        await sendMessage(from, "No active orders at the moment.");
-        return;
+    // ── Owner: query orders from sheet (#orders [today|<status>]) ────────────────
+    if (isOwner && /^#orders?\b/i.test(text.trim())) {
+      const arg = text.trim().split(/\s+/)[1]?.toLowerCase();
+      try {
+        const filter = {};
+        if (arg === "today") filter.dateFilter = "today";
+        else if (arg) filter.status = arg;
+
+        const orders = await getOrdersFromSheet(filter);
+        if (orders.length === 0) {
+          await sendMessage(from, arg ? `No orders found for "${arg}".` : "No orders in the sheet yet.");
+          return;
+        }
+
+        const header = arg === "today" ? `Today's Orders` : arg ? `Orders — ${arg}` : `All Orders`;
+        const list = orders.slice(-15).reverse()
+          .map((o) =>
+            `${o.orderId}\n👤 ${o.name} (${o.phone})\n🛒 ${o.product} x${o.quantity}\n💰 KSh ${o.total}\n📋 ${o.status}\n🕐 ${o.timestamp}`
+          )
+          .join("\n─────────────\n");
+
+        for (const chunk of chunkMessage(`📋 ${header} (${orders.length}):\n\n${list}`)) {
+          await sendMessage(from, chunk);
+        }
+      } catch (err) {
+        console.error("Orders sheet query failed:", err.message);
+        await sendMessage(from, "Failed to read orders from sheet. Check Google Sheets config.");
       }
-      const list = orders
-        .map((o) =>
-          `${o.orderId}\n👤 ${o.name} (+${o.phone})\n🛒 ${o.items}\n📍 ${o.location}\nStatus: ${STATUS_LABELS[o.status] || o.status}`
-        )
-        .join("\n─────────────\n");
-      await sendMessage(from, `📋 Active Orders (${orders.length}):\n\n${list}`);
       return;
     }
 
-    // ── Owner: update order status (#order <id> <status>) ─────────────────────
+    // ── Owner: update order status in sheet (#order <id> <status>) ───────────────
     if (isOwner && /^#order\s+\S+\s+\S+/i.test(text.trim())) {
       const parts = text.trim().split(/\s+/);
       const orderId = parts[1].toUpperCase();
@@ -247,17 +278,62 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      const order = await updateOrderStatus(orderId, newStatus);
-      if (!order) {
-        await sendMessage(from, `Order ${orderId} not found.`);
-        return;
+      try {
+        const order = await updateOrderStatusRow(orderId, newStatus);
+        if (!order) {
+          await sendMessage(from, `Order ${orderId} not found in sheet.`);
+          return;
+        }
+
+        await sendMessage(from, `✅ ${orderId} → ${newStatus}`);
+
+        if (process.env.ORDER_NOTIFY !== "false" && order.phone) {
+          await sendMessage(order.phone, buildStatusMessage(order, newStatus));
+          console.log(`📬 [Status notification → ${order.phone}]: ${newStatus}`);
+        }
+      } catch (err) {
+        console.error("Order status update failed:", err.message);
+        await sendMessage(from, "Failed to update order status.");
       }
+      return;
+    }
 
-      await sendMessage(from, `✅ ${orderId} → ${newStatus}`);
+    // ── Owner: full inventory catalogue (#stock [category]) ───────────────────────
+    if (isOwner && /^#(stock|inventory)\b/i.test(text.trim())) {
+      const category = text.trim().split(/\s+/).slice(1).join(" ").toLowerCase();
+      try {
+        let inventory = await getInventory();
+        if (category) {
+          inventory = inventory.filter((p) => p.category.toLowerCase().includes(category));
+        }
+        if (inventory.length === 0) {
+          await sendMessage(from, category ? `No products found in "${category}".` : "Inventory is empty.");
+          return;
+        }
 
-      if (process.env.ORDER_NOTIFY !== "false") {
-        await sendMessage(order.phone, buildStatusMessage(order, newStatus));
-        console.log(`📬 [Status notification → ${order.phone}]: ${newStatus}`);
+        const grouped = {};
+        inventory.forEach((p) => {
+          if (!grouped[p.category]) grouped[p.category] = [];
+          grouped[p.category].push(p);
+        });
+
+        let msg = `📦 *Inventory* (${inventory.length} items):\n\n`;
+        for (const [cat, items] of Object.entries(grouped)) {
+          msg += `*${cat}*\n`;
+          items.forEach((p) => {
+            const stock = p.quantity > 0 ? `${p.quantity} units` : "OUT OF STOCK";
+            msg += `• ${p.brand} ${p.name} ${p.model} — KSh ${p.price} (${stock})\n`;
+          });
+          msg += "\n";
+        }
+
+        for (const chunk of chunkMessage(msg)) {
+          await sendMessage(from, chunk);
+        }
+        console.log(`📦 [Inventory sent to owner — ${inventory.length} items]`);
+      } catch (err) {
+        console.error("Inventory query failed:", err.message);
+        await sendMessage(from, "Failed to read inventory from sheet.");
       }
       return;
     }
