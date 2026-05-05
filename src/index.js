@@ -237,7 +237,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     // ── Owner: query orders from sheet (#orders [today|<status>]) ────────────────
-    if (isOwner && /^#orders?\b/i.test(text.trim())) {
+    if (isOwner && /^#orders\b/i.test(text.trim())) {
       const arg = text.trim().split(/\s+/)[1]?.toLowerCase();
       try {
         const filter = {};
