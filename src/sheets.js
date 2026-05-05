@@ -129,7 +129,7 @@ async function getCategorySummary() {
 async function appendOrderRow(order) {
   const sheets = await getSheetsClient();
   const sheetId = process.env.GOOGLE_SHEET_ID;
-  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "OrdersTable";
+  const tabName = process.env.GOOGLE_ORDERS_TAB_NAME || "Orders";
 
   try {
     await sheets.spreadsheets.values.append({
